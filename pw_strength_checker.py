@@ -2,34 +2,28 @@
 """
 Enhanced Password Strength Checker (Flask)
 
-Features:
-- Masked password input
-- Multi-signal scoring (length, classes, entropy, repeats, sequences, dictionary)
-- Concrete prioritized recommendations
-- Local breach check against a wordlist:
-    - will try common system paths (e.g. /usr/share/wordlists/rockyou.txt)
-    - or you can upload a wordlist (one password per line)
-- Fully local (no external calls). Only run in trusted, local environments.
+- Runs on 127.0.0.1:5100 by default
+- Masks password input in the form
+- Multi-signal scoring (length, classes, entropy, repeats, sequences)
+- Prioritized recommendations
+- Local breach check against system wordlist or uploaded wordlist
+- Robust error logging: exceptions write to error.log
 
-Run:
-    pip install flask
-    python pw_strength_checker.py
-    open http://127.0.0.1:5000
-
-Security note: Do not deploy this publicly. Treat any demo passwords as sensitive.
+SECURITY: This is a local demo only. Do NOT deploy publicly. If a password is
+found in a wordlist, the app will display it in clear text on the results page
+(per your request). Use only test passwords.
 """
-from flask import Flask, request, render_template_string, redirect, url_for, flash
+from flask import Flask, request, render_template_string
 import math
 import os
 import re
 import time
-import hashlib
+import traceback
 
 app = Flask(__name__)
-app.secret_key = "dev-only-secret"  # local demo only
+app.secret_key = "dev-only-secret"
 
 APP_DIR = os.getcwd()
-# Candidate system paths for rockyou or other large wordlists
 COMMON_WORDLIST_PATHS = [
     "/usr/share/wordlists/rockyou.txt",
     "/usr/dict/rockyou.txt",
@@ -37,14 +31,16 @@ COMMON_WORDLIST_PATHS = [
     os.path.join(APP_DIR, "wordlist.txt"),
 ]
 
-# Small built-in common list for fast demo
 BUILTIN_COMMON = {
     "password", "123456", "123456789", "qwerty", "abc123", "password1",
     "111111", "123123", "letmein", "welcome", "admin", "passw0rd",
     "iloveyou", "monkey", "dragon"
 }
 
-# Template (kept inline for single-file demo)
+SEQUENCE_PATTERNS = [
+    "0123456789", "abcdefghijklmnopqrstuvwxyz", "qwertyuiop", "asdfghjkl", "zxcvbnm"
+]
+
 TEMPLATE = """
 <!doctype html>
 <html>
@@ -74,30 +70,36 @@ TEMPLATE = """
     .small { font-size:0.9rem; color:#444 }
     .grid { display:grid; grid-template-columns: 1fr 260px; gap:12px }
     .right-card { background:#fff; border-radius:8px; padding:12px; border:1px solid #eef2f8 }
+    .error { background:#fff3f3; border:1px solid #f5c2c2; color:#7a1a1a; padding:8px; border-radius:6px; margin-bottom:12px }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Password Strength Checker — Enhanced</h1>
-    <div class="muted">Local demo — passwords never leave this machine. Use this to teach password hygiene.</div>
+    <div class="muted">Local demo — passwords never leave this machine unless you upload a wordlist.</div>
+
+    {% if error_message %}
+      <div class="error"><strong>Note:</strong> {{ error_message }} — see <code>error.log</code> for details.</div>
+    {% endif %}
+
     <hr style="margin:12px 0">
     <form method="post" enctype="multipart/form-data">
       <div class="col">
         <label>Optional username (for context):</label>
         <input type="text" name="username" placeholder="e.g., alice">
 
-        <label style="margin-top:10px">Password (your input stays local):</label>
+        <label style="margin-top:10px">Password (input is masked):</label>
         <input type="password" name="password" required autocomplete="new-password" placeholder="Type a password">
 
         <label style="margin-top:10px">Check breach against:</label>
         <select name="wordlist_choice">
-          <option value="">(auto) try system rockyou / builtin</option>
+          <option value="">(auto) system rockyou / builtin</option>
           <option value="upload">Upload a wordlist file (one password per line)</option>
         </select>
 
         <div style="margin-top:8px">
           <input type="file" name="wordlist_file">
-          <div class="muted small">If you upload a wordlist it will be used for breach checks only and saved in the app folder.</div>
+          <div class="muted small">If you upload, it will be used for breach checks only and saved in the app folder.</div>
         </div>
 
         <div style="margin-top:12px; display:flex; gap:8px">
@@ -105,7 +107,6 @@ TEMPLATE = """
           <a href="{{ url_for('index') }}"><button type="button" style="background:#6c757d">Reset</button></a>
         </div>
       </div>
-
       <div style="width:320px">
         <div class="right-card">
           <div class="small"><strong>How scoring works</strong></div>
@@ -161,7 +162,12 @@ TEMPLATE = """
           </div>
         </div>
 
-        {% if result.breach_details %}
+        {% if result.breached %}
+          <hr>
+          <strong>Breach details</strong>
+          <pre>Password found: "{{ result.plain_password }}" — Source: {{ result.checked_source }}</pre>
+          <div class="muted small">The password is displayed above exactly as you entered it. Remove sensitive examples immediately after demo.</div>
+        {% elif result.breach_details %}
           <hr>
           <strong>Breach details</strong>
           <pre>{{ result.breach_details }}</pre>
@@ -169,19 +175,15 @@ TEMPLATE = """
       </div>
     {% endif %}
 
-    <footer>Developed by Eng CyberWolf </footer>
+    <footer> Developed by Eng CyberWolf </footer>
   </div>
 </body>
 </html>
 """
 
-# --- Helper functions for password analysis --- #
+# ---------------- helper functions ---------------- #
 
 def estimate_entropy(password: str) -> float:
-    """
-    Estimate entropy bits by approximating pool size based on character classes:
-    entropy = length * log2(pool_size)
-    """
     pool = 0
     if any(c.islower() for c in password):
         pool += 26
@@ -190,15 +192,12 @@ def estimate_entropy(password: str) -> float:
     if any(c.isdigit() for c in password):
         pool += 10
     if any(not c.isalnum() for c in password):
-        pool += 32  # rough symbol count
+        pool += 32
     if pool == 0:
         return 0.0
     return len(password) * math.log2(pool)
 
 def human_readable_guess_count(guesses: float) -> str:
-    """
-    Convert guess count into readable format.
-    """
     if guesses < 1e3:
         return f"{int(guesses)} guesses"
     for unit, div in (("k", 1e3), ("M", 1e6), ("B", 1e9), ("T", 1e12), ("P", 1e15)):
@@ -206,64 +205,40 @@ def human_readable_guess_count(guesses: float) -> str:
             return f"{guesses/div:.2f}{unit} guesses"
     return f"{guesses:.2e} guesses"
 
-SEQUENCE_PATTERNS = [
-    "0123456789", "abcdefghijklmnopqrstuvwxyz", "qwertyuiop", "asdfghjkl", "zxcvbnm"
-]
-
 def has_sequence(password: str, min_len: int = 4) -> bool:
-    """
-    Detect if password contains increasing/decreasing sequences or keyboard patterns.
-    Case-insensitive.
-    """
     pw = password.lower()
-    # check direct sequences
     for seq in SEQUENCE_PATTERNS:
         for i in range(len(seq) - min_len + 1):
             slice_ = seq[i:i+min_len]
             if slice_ in pw or slice_[::-1] in pw:
                 return True
-    # check numeric run
-    if re.search(r"(?:\d)\1{3,}", pw):
+    # Check for repeated digits 4+ times (fixed regex uses a capturing group)
+    if re.search(r"(\d)\1{3,}", pw):
         return True
     return False
 
 def has_repeated_run(password: str, min_len: int = 4) -> bool:
-    """
-    Detect long repeated characters or repeated substrings like 'aaaa' or 'ababab'
-    """
-    # repeated single char
     if re.search(r"(.)\1{" + str(min_len-1) + r",}", password):
         return True
-    # repeated substring simple check
-    # check if password is composed of 2- or 3-char pattern repeated many times
     n = len(password)
     for size in (2, 3, 4):
-        if n >= size * 3:  # repeated at least 3 times
+        if n >= size * 3:
             pattern = password[:size]
             if pattern * (n // size) == password[:size*(n//size)]:
                 return True
     return False
 
 def is_common_password(password: str, loaded_set=None) -> (bool, str):
-    """
-    Check if password exists in a provided set (loaded_set) or in known system paths.
-    Returns (found_bool, source_string)
-    If loaded_set is provided: check that set first.
-    If not, try common system paths (stream-check).
-    """
     pw_lower = password.strip().lower()
     if loaded_set:
         if pw_lower in loaded_set:
-            return True, "uploaded wordlist"
+            return True, f"uploaded wordlist"
         return False, "uploaded wordlist"
-    # check builtin small set
     if pw_lower in BUILTIN_COMMON:
         return True, "builtin common list"
-    # try system candidate paths (stream-check line-by-line)
     for path in COMMON_WORDLIST_PATHS:
         try:
             if os.path.isfile(path):
-                # stream search, compare lowercased lines
                 with open(path, "r", encoding="utf-8", errors="ignore") as fh:
                     for line in fh:
                         if pw_lower == line.strip().lower():
@@ -273,44 +248,32 @@ def is_common_password(password: str, loaded_set=None) -> (bool, str):
     return False, "none"
 
 def compute_score(password: str, loaded_set=None) -> dict:
-    """
-    Compute a comprehensive score and recommendations.
-    """
     length = len(password)
     entropy = estimate_entropy(password)
-    # approximate number of guesses (assuming attacker enumerates pool^length)
-    # This is a rough heuristic; real-world cracking uses wordlists/rules which are far more effective.
     guesses = max(1.0, 2 ** entropy)
 
-    # char class checks
     has_lower = any(c.islower() for c in password)
     has_upper = any(c.isupper() for c in password)
     has_digit = any(c.isdigit() for c in password)
     has_symbol = any(not c.isalnum() for c in password)
     class_count = sum([has_lower, has_upper, has_digit, has_symbol])
 
-    # pattern checks
     seq = has_sequence(password)
-    repeat = has_repeated_run(password)
+    rep = has_repeated_run(password)
+    common, source = is_common_password(password, loaded_set)
 
-    # dictionary / common password
-    is_common, source = is_common_password(password, loaded_set)
-
-    # base score component: normalized entropy (scale to 0-80)
-    # Map entropy to 0-80: 0 bits -> 0, 80 bits -> 80 (cap at 80)
-    entropy_score = min(80, entropy)
-    # class bonus (0-20)
-    class_bonus = (class_count - 1) * 6  # up to 18
+    # Score logic: combine entropy portion + class bonus, apply penalties
+    entropy_score = min(80, entropy)  # map entropy to 0-80
+    class_bonus = (class_count - 1) * 6
     if length >= 16:
-        class_bonus += 6  # encourage long passphrases
+        class_bonus += 6
 
-    # penalties
     penalty = 0
-    if is_common:
+    if common:
         penalty += 60
     if seq:
         penalty += 12
-    if repeat:
+    if rep:
         penalty += 12
     if length < 8:
         penalty += 12
@@ -319,13 +282,10 @@ def compute_score(password: str, loaded_set=None) -> dict:
 
     raw_score = entropy_score + class_bonus - penalty
     score = max(0, min(100, int(raw_score)))
-
-    # color
     color = "#dc3545" if score < 40 else ("#ffc107" if score < 70 else "#28a745")
 
-    # recommendations (prioritized)
     recs = []
-    if is_common:
+    if common:
         recs.append("This password appears in a common password list — do not use it.")
     if length < 12:
         recs.append("Use a passphrase of at least 12 characters (longer is better).")
@@ -337,42 +297,15 @@ def compute_score(password: str, loaded_set=None) -> dict:
         recs.append("Include digits (0-9).")
     if seq:
         recs.append("Avoid obvious sequences like '1234' or 'qwerty'.")
-    if repeat:
+    if rep:
         recs.append("Avoid long repeated characters or repeated short patterns.")
     if not recs:
         recs.append("Good password. Consider using a password manager to generate & store unique passwords.")
 
-    # guess-time-ish (assuming 1e9 guesses/sec for demonstration — adjust in README)
-    guesses_per_second = 1e9
-    seconds = guesses / guesses_per_second
-    # convert to readable
-    time_units = [
-        ("years", 60*60*24*365),
-        ("days", 60*60*24),
-        ("hours", 60*60),
-        ("minutes", 60),
-        ("seconds", 1)
-    ]
-    if seconds < 1:
-        guess_time_str = "< 1 second (very easy)"
-    else:
-        remaining = seconds
-        parts = []
-        for name, sec in time_units:
-            if remaining >= sec:
-                v = int(remaining // sec)
-                remaining = remaining % sec
-                parts.append(f"{v} {name}")
-            if len(parts) >= 2:
-                break
-        guess_time_str = ", ".join(parts)
-
     return {
         "score": score,
         "entropy": entropy,
-        "guess_count": guesses,
         "guess_count_str": human_readable_guess_count(guesses),
-        "guess_time_str": guess_time_str,
         "length": length,
         "has_lower": has_lower,
         "has_upper": has_upper,
@@ -380,18 +313,17 @@ def compute_score(password: str, loaded_set=None) -> dict:
         "has_symbol": has_symbol,
         "class_count": class_count,
         "has_sequence": seq,
-        "has_repeat": repeat,
-        "is_common": is_common,
+        "has_repeat": rep,
+        "is_common": common,
+        "breached": common,
         "checked_source": source,
         "recommendations": recs,
-        "color": color
+        "color": color,
+        "plain_password": password if common else "",
+        "breach_details": f"Password found in {source}" if common else ""
     }
 
-def stream_wordlist_to_set(uploaded_file_path: str, limit: int = 1000000) -> set:
-    """
-    Load a user-uploaded wordlist into a set for fast lookup.
-    Limit number of lines by 'limit' to avoid OOM on huge uploads.
-    """
+def stream_wordlist_to_set(uploaded_file_path: str, limit: int = 500000) -> set:
     s = set()
     try:
         with open(uploaded_file_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -405,76 +337,68 @@ def stream_wordlist_to_set(uploaded_file_path: str, limit: int = 1000000) -> set
         pass
     return s
 
-# --- Flask routes --- #
+def secure_filename(filename: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(filename))
+
+# ---------------- Flask route ---------------- #
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     result = None
-    if request.method == "POST":
-        password = request.form.get("password", "")
-        username = request.form.get("username", "").strip()
-        choice = request.form.get("wordlist_choice", "")
-        uploaded = request.files.get("wordlist_file")
+    error_message = None
+    try:
+        if request.method == "POST":
+            password = request.form.get("password", "")
+            choice = request.form.get("wordlist_choice", "")
+            uploaded = request.files.get("wordlist_file")
 
-        # handle uploaded wordlist
-        loaded_set = None
-        checked_source = "builtin"
-        if choice == "upload" and uploaded and uploaded.filename:
-            filename = secure_filename(uploaded.filename)
-            save_path = os.path.join(APP_DIR, filename)
-            try:
-                uploaded.save(save_path)
-                loaded_set = stream_wordlist_to_set(save_path, limit=500000)
-                checked_source = f"uploaded: {filename} (limited load)"
-            except Exception:
-                loaded_set = None
-                checked_source = "uploaded (failed to read)"
-        else:
-            # no uploaded set; leave loaded_set None and is_common will stream-check system files or builtin
             loaded_set = None
+            checked_source = "builtin"
+            if choice == "upload" and uploaded and getattr(uploaded, "filename", ""):
+                filename = secure_filename(uploaded.filename)
+                save_path = os.path.join(APP_DIR, filename)
+                try:
+                    uploaded.save(save_path)
+                    loaded_set = stream_wordlist_to_set(save_path, limit=500000)
+                    checked_source = f"uploaded: {filename} (limited load)"
+                except Exception:
+                    loaded_set = None
+                    checked_source = "uploaded (failed to read)"
 
-        # first check: is exact password in loaded_set or system list?
-        is_breached = False
-        breach_source = "none"
-        if loaded_set is not None:
-            if password.strip().lower() in loaded_set:
-                is_breached = True
-                breach_source = checked_source
-        else:
-            # try builtin quick check
-            found, source = is_common_password(password, None)
-            if found:
-                is_breached = True
-                breach_source = source
+            # check breach first: loaded_set -> builtin -> system
+            breached = False
+            breach_source = "none"
+            if loaded_set is not None:
+                if password.strip().lower() in loaded_set:
+                    breached = True
+                    breach_source = checked_source
             else:
-                breach_source = "system+builtin check (no upload)"
+                found, source = is_common_password(password, None)
+                if found:
+                    breached = True
+                    breach_source = source
 
-        # compute score + recommendations
-        result = compute_score(password, loaded_set if loaded_set else None)
-        # override checked_source with more specific
-        result["checked_source"] = breach_source if is_breached else result["checked_source"]
-        result["breached"] = is_breached
-        if is_breached:
-            # add breach detail
-            result["breach_details"] = f"Password found in {breach_source}"
-        else:
-            result["breach_details"] = ""
+            # compute score
+            result = compute_score(password, loaded_set if loaded_set else None)
+            # override checked_source and breached state
+            result["checked_source"] = breach_source if breached else result["checked_source"]
+            result["breached"] = breached
+            if breached:
+                # per user request: show cleartext password in the UI if breached (local demo only)
+                result["plain_password"] = password
+                result["breach_details"] = f"Password found in {breach_source}"
+    except Exception:
+        tb = traceback.format_exc()
+        try:
+            with open(os.path.join(APP_DIR, "error.log"), "a", encoding="utf-8") as fh:
+                fh.write(f"\n\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                fh.write(tb)
+        except Exception:
+            pass
+        error_message = "An internal error occurred. Details written to error.log."
 
-    # detect whether any common system wordlist exists
-    wl_path = None
-    for p in COMMON_WORDLIST_PATHS:
-        if os.path.isfile(p):
-            wl_path = p
-            break
-    wl_display = wl_path if wl_path else "(builtin small list)"
-
-    return render_template_string(TEMPLATE, result=result, wl_display=wl_display)
-
-# minimal helper for secure_filename (avoid extra dependency)
-def secure_filename(filename: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(filename))
+    return render_template_string(TEMPLATE, result=result, error_message=error_message)
 
 if __name__ == "__main__":
-    print("Starting Password Strength Checker (local demo).")
-    print("If you want faster breach checks, place rockyou.txt at one of:", COMMON_WORDLIST_PATHS)
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    print("Starting Password Strength Checker (local demo) on http://127.0.0.1:5100")
+    app.run(host="127.0.0.1", port=5100, debug=False)
